@@ -38,6 +38,12 @@ export interface Options {
    * @default "react"
    */
   jsxImportSource?: string
+  /**
+   * Set this to `true` to annotate the JSX factory with `\/* @__PURE__ *\/`.
+   * This option is ignored when `jsxRuntime` is not `"automatic"`.
+   * @default true
+   */
+  jsxPure?: boolean
 
   /**
    * Babel configuration applied in both dev and prod.
@@ -47,6 +53,40 @@ export interface Options {
    * @deprecated Use `babel.parserOpts.plugins` instead
    */
   parserPlugins?: ParserOptions['plugins']
+}
+
+export type BabelOptions = Omit<
+  TransformOptions,
+  | 'ast'
+  | 'filename'
+  | 'root'
+  | 'sourceFileName'
+  | 'sourceMaps'
+  | 'inputSourceMap'
+>
+
+/**
+ * The object type used by the `options` passed to plugins with
+ * an `api.reactBabel` method.
+ */
+export interface ReactBabelOptions extends BabelOptions {
+  plugins: Extract<BabelOptions['plugins'], any[]>
+  presets: Extract<BabelOptions['presets'], any[]>
+  overrides: Extract<BabelOptions['overrides'], any[]>
+  parserOpts: ParserOptions & {
+    plugins: Extract<ParserOptions['plugins'], any[]>
+  }
+}
+
+declare module 'vite' {
+  export interface Plugin {
+    api?: {
+      /**
+       * Manipulate the Babel options of `@vitejs/plugin-react`
+       */
+      reactBabel?: (options: ReactBabelOptions, config: ResolvedConfig) => void
+    }
+  }
 }
 
 export default function viteReact(opts: Options = {}): PluginOption[] {
@@ -80,9 +120,17 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
 
   const useAutomaticRuntime = opts.jsxRuntime !== 'classic'
 
-  const userPlugins = opts.babel?.plugins || []
-  const userParserPlugins =
-    opts.parserPlugins || opts.babel?.parserOpts?.plugins || []
+  const babelOptions = {
+    babelrc: false,
+    configFile: false,
+    ...opts.babel
+  } as ReactBabelOptions
+
+  babelOptions.plugins ||= []
+  babelOptions.presets ||= []
+  babelOptions.overrides ||= []
+  babelOptions.parserOpts ||= {} as any
+  babelOptions.parserOpts.plugins ||= opts.parserPlugins || []
 
   // Support patterns like:
   // - import * as React from 'react';
@@ -111,15 +159,21 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
         )
       }
 
-      config.plugins.forEach(
-        (plugin) =>
-          (plugin.name === 'react-refresh' ||
-            (plugin !== viteReactJsx && plugin.name === 'vite:react-jsx')) &&
-          config.logger.warn(
+      config.plugins.forEach((plugin) => {
+        const hasConflict =
+          plugin.name === 'react-refresh' ||
+          (plugin !== viteReactJsx && plugin.name === 'vite:react-jsx')
+
+        if (hasConflict)
+          return config.logger.warn(
             `[@vitejs/plugin-react] You should stop using "${plugin.name}" ` +
               `since this plugin conflicts with it.`
           )
-      )
+
+        if (plugin.api?.reactBabel) {
+          plugin.api.reactBabel(babelOptions, config)
+        }
+      })
     },
     async transform(code, id, options) {
       const ssr = typeof options === 'boolean' ? options : options?.ssr === true
@@ -138,20 +192,19 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
             ? !shouldProjectExclude(id)
             : shouldProjectInclude(id)
 
-        const plugins = isProjectFile ? [...userPlugins] : []
+        const plugins = isProjectFile ? [...babelOptions.plugins] : []
 
-        const usingFastRefresh =
-          !ssr &&
-          !isNodeModules &&
-          shouldUseFastRefresh(id) &&
+        let useFastRefresh = false
+        if (shouldUseFastRefresh(id) && !ssr && !isNodeModules) {
           // Modules with .js or .ts extension must import React.
-          (isJSX || code.includes('react'))
-
-        if (usingFastRefresh) {
-          plugins.push([
-            await loadPlugin('react-refresh/babel.js'),
-            { skipEnvCheck: true }
-          ])
+          const isReactModule = isJSX || importReactRE.test(code)
+          if (isReactModule) {
+            useFastRefresh = true
+            plugins.push([
+              await loadPlugin('react-refresh/babel'),
+              { skipEnvCheck: true }
+            ])
+          }
         }
 
         let ast: t.File | null | undefined
@@ -173,7 +226,8 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
                 ),
                 {
                   runtime: 'automatic',
-                  importSource: opts.jsxImportSource
+                  importSource: opts.jsxImportSource,
+                  pure: opts.jsxPure !== false
                 }
               ])
 
@@ -205,15 +259,15 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
         // module, including node_modules and linked packages.
         const shouldSkip =
           !plugins.length &&
-          !opts.babel?.configFile &&
-          !(isProjectFile && opts.babel?.babelrc)
+          !babelOptions.configFile &&
+          !(isProjectFile && babelOptions.babelrc)
 
         if (shouldSkip) {
           return // Avoid parsing if no plugins exist.
         }
 
-        const parserPlugins: typeof userParserPlugins = [
-          ...userParserPlugins,
+        const parserPlugins: typeof babelOptions.parserOpts.plugins = [
+          ...babelOptions.parserOpts.plugins,
           'importMeta',
           // This plugin is applied before esbuild transforms the code,
           // so we need to enable some stage 3 syntax that is supported in
@@ -232,39 +286,36 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
           parserPlugins.push('typescript')
         }
 
-        const isReasonReact = extension.endsWith('.bs.js')
+        const transformAsync = ast
+          ? babel.transformFromAstAsync.bind(babel, ast, code)
+          : babel.transformAsync.bind(babel, code)
 
-        const babelOpts: TransformOptions = {
-          babelrc: false,
-          configFile: false,
-          ...opts.babel,
+        const isReasonReact = extension.endsWith('.bs.js')
+        const result = await transformAsync({
+          ...babelOptions,
           ast: !isReasonReact,
           root: projectRoot,
           filename: id,
           sourceFileName: filepath,
           parserOpts: {
-            ...opts.babel?.parserOpts,
+            ...babelOptions.parserOpts,
             sourceType: 'module',
             allowAwaitOutsideFunction: true,
             plugins: parserPlugins
           },
           generatorOpts: {
-            ...opts.babel?.generatorOpts,
+            ...babelOptions.generatorOpts,
             decoratorsBeforeExport: true
           },
           plugins,
           sourceMaps: true,
           // Vite handles sourcemap flattening
           inputSourceMap: false as any
-        }
-
-        const result = ast
-          ? await babel.transformFromAstAsync(ast, code, babelOpts)
-          : await babel.transformAsync(code, babelOpts)
+        })
 
         if (result) {
           let code = result.code!
-          if (usingFastRefresh && /\$RefreshReg\$\(/.test(code)) {
+          if (useFastRefresh && /\$RefreshReg\$\(/.test(code)) {
             const accept = isReasonReact || isRefreshBoundary(result.ast!)
             code = addRefreshWrapper(code, id, accept)
           }
@@ -295,8 +346,8 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
         return runtimeCode
       }
     },
-    transformIndexHtml() {
-      if (!skipFastRefresh)
+    transformIndexHtml(code, options) {
+      if (shouldUseFastRefresh(options.filename))
         return [
           {
             tag: 'script',
@@ -345,5 +396,8 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
 viteReact.preambleCode = preambleCode
 
 // overwrite for cjs require('...')() usage
-module.exports = viteReact
-viteReact['default'] = viteReact
+// The following lines are inserted by scripts/patchEsbuildDist.ts,
+// this doesn't bundle correctly after esbuild 0.14.4
+//
+// module.exports = viteReact
+// viteReact['default'] = viteReact
